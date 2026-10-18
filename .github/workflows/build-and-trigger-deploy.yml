@@ -1,0 +1,131 @@
+name: Build & Deploy
+
+# push main -> imagem main-<sha7> -> deploy em prod
+# push test -> imagem test-<sha7> -> deploy em test
+# pull request -> só build e testes
+# O deploy é feito pelo deploy.yml do repositório de infra (bcode-infra-k8s).
+
+on:
+  push:
+    branches: [main, test]
+  pull_request:
+    branches: [main, test]
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: bcode-hangfire-task-scheduler
+  DOCKERFILE: BCode.HangfireTaskScheduler/Dockerfile
+  DOTNET_VERSION: '9.0.x'
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test --configuration Release --no-build --verbosity normal
+
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+      deploy_env: ${{ steps.vars.outputs.deploy_env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Variáveis
+        id: vars
+        shell: bash
+        run: |
+          BRANCH="$GITHUB_REF_NAME"
+          case "$BRANCH" in
+            main) DEPLOY_ENV="prod" ;;
+            test) DEPLOY_ENV="test" ;;
+            *) echo "::error::branch sem ambiente: $BRANCH"; exit 1 ;;
+          esac
+          {
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+            echo "image_tag=${BRANCH}-${GITHUB_SHA::7}"
+            echo "latest_tag=latest-${BRANCH}"
+            echo "deploy_env=${DEPLOY_ENV}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.image_tag }}
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.latest_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resumo
+        shell: bash
+        run: |
+          {
+            echo "### Imagem publicada"
+            echo "\`${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.image_tag }}\`"
+            echo "Ambiente: \`${{ steps.vars.outputs.deploy_env }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  trigger-deploy:
+    name: Trigger Deploy
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push'
+    steps:
+      - name: Disparar deploy.yml no repositório de infra
+        shell: bash
+        env:
+          INFRA_REPO: ${{ secrets.INFRA_REPO }}
+          INFRA_REPO_PAT: ${{ secrets.INFRA_REPO_PAT }}
+          DEPLOY_ENV: ${{ needs.build-and-push.outputs.deploy_env }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          [ -n "$INFRA_REPO" ] || { echo "::error::secret INFRA_REPO não configurado (ex.: LucasLm2/bcode-infra-k8s)"; exit 1; }
+          [ -n "$INFRA_REPO_PAT" ] || { echo "::error::secret INFRA_REPO_PAT não configurado"; exit 1; }
+          BODY=$(jq -nc --arg app "$APP_NAME" --arg env "$DEPLOY_ENV" --arg tag "$IMAGE_TAG" \
+            '{ref: "main", inputs: {app: $app, env: $env, image_tag: $tag}}')
+          HTTP_CODE=$(curl -sS -o response.json -w '%{http_code}' -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $INFRA_REPO_PAT" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$INFRA_REPO/actions/workflows/deploy.yml/dispatches" \
+            -d "$BODY")
+          if [ "$HTTP_CODE" != 204 ]; then
+            echo "::error::falha ao disparar o deploy (HTTP $HTTP_CODE)"; cat response.json; exit 1
+          fi
+          echo "Deploy disparado: $APP_NAME -> $DEPLOY_ENV ($IMAGE_TAG)" | tee -a "$GITHUB_STEP_SUMMARY"
